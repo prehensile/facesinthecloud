@@ -1,0 +1,5 @@
+{
+	"api_key" : "some_api_key",
+	"api_secret" : "some_api_secret",
+	"token" : "valid_api_token"
+}
