@@ -13,32 +13,64 @@ import datetime
 import xml.etree.ElementTree as ElementTree
 import re
 
+
 class FlickrSource:
 
     def __init__( self, api ):
         self.photo = None
         self.api = api
         self.photo_id = None
+        self.tag = None
 
     def get_image_url( self ):
-        image_url = None
         logger.info( "Fetching from Flickr..." )
-        photos = self.api.photos_search( license="1,2,4,5" )
-        photos = photos.findall("photos/photo")
-        photo = random.choice( photos )
-        photo_id = photo.attrib['id']
-        sizes = self.api.photos_getSizes( photo_id=photo_id ).findall("sizes/size")
         
-        # step though photo sizes
-        max_size_found = 0
-        max_size_usable = 1024
-        for size in sizes:
-            w = int(size.attrib['width'])
-            if w > max_size_found and w < max_size_usable:
-                image_url = size.attrib['source']
-                max_size_found = w
+        image_url = None
+        failsafe = 10
+        
+        # step 0: get a list of currently exciting tags
+        tags = self.api.tags_getHotList( count=200 )
+        tags = tags.findall( "hottags/tag" )
 
-        self.photo_id = photo_id
+        while image_url is None and failsafe > 0:
+            
+            # step one: pick an exciting tag
+            tag = None
+            while tag is None:
+                tag = random.choice( tags )
+                if "dress" in tag.text:  # flickr has weird dress-related tag spam O_o
+                    tag = None
+            tag = tag.text
+            logger.info( "...using tag: %s" % tag )
+
+            # step two: find remix-licensed images for chosen tag
+            ## wrapped in a try to cope with encoding errors when tag contains unencodable characters
+            try:
+                photos = self.api.photos_search( license="1,2,4,5", tags=tag )
+                photos = photos.findall("photos/photo")
+                if len( photos ) > 0:
+                    photo = random.choice( photos )
+                    photo_id = photo.attrib['id']
+                    sizes = self.api.photos_getSizes( photo_id=photo_id ).findall("sizes/size")
+                    
+                    # step three: find largest usable image
+                    max_size_found = 0
+                    max_size_usable = 1024
+                    for size in sizes:
+                        w = int(size.attrib['width'])
+                        if w > max_size_found and w < max_size_usable:
+                            image_url = size.attrib['source']
+                            max_size_found = w
+                    
+                    self.photo_id = photo_id
+                    self.tag = tag
+
+            except UnicodeDecodeError, e:
+                # do nothing if tag encode failed
+                pass
+            
+            failsafe -= 1
+
         return image_url
     
     def get_credit( self ):
@@ -50,6 +82,9 @@ class FlickrSource:
             item_link = photo_info.find( "photo/urls/url[@type='photopage']" ).text
             credit = """After an <a href="%s">original</a> by <a href="%s">%s</a>.""" % ( item_link, author_link, author_name )
         return credit
+
+    def get_tag( self ):
+        return self.tag
 
 
 class ffffoundSource:
@@ -84,10 +119,8 @@ class ffffoundSource:
             credit = """After a <a href="%s">ffffinding</a> by <a href="%s">%s</a>.""" % ( link, author_link, author )
         return credit
 
-def dump_file( pth, contents ):
-    fh = open( pth, 'w')
-    fh.write( contents )
-    fh.close()
+    def get_tag( self ):
+        return None
 
 
 class InstagramSource:
@@ -95,6 +128,7 @@ class InstagramSource:
     def __init__( self ):
         self.item = None
         self.photopage_soup = None
+        self.tag = None
 
     def get_description_soup( self ):
         if( self.item ):
@@ -104,9 +138,20 @@ class InstagramSource:
             return self._description_soup
 
     def get_image_url( self ):
-        image_url = None
         logger.info( "Fetching from Instagram..." )
-        h = urllib2.urlopen( "http://widget.stagram.com/rss/popular/" )
+        image_url = None    
+
+        # step one: scrape currently-wonderful tags from webstagr.am, pick one
+        h = urllib2.urlopen( "http://web.stagram.com/hot/" )
+        soup = Soup.BeautifulStoneSoup( h.read() )
+        tags = soup.findAll( "a", href=re.compile("^/tag/") )
+        tag = random.choice( tags )
+        self.tag = tag.text[1:]  # chop off the # at the beginning
+        logger.info( "...using tag: %s" % self.tag )
+
+        # step two: search on chosen tag
+        url = "http://widget.stagram.com/rss" + tag["href"]
+        h = urllib2.urlopen( url )
         soup = Soup.BeautifulStoneSoup( h.read() )
         items = soup.findAll( "item" )
         item = random.choice( items )
@@ -120,6 +165,7 @@ class InstagramSource:
                 if this_image_url.string == "Large":
                     image_url = this_image_url['href']
                     break
+
         return image_url 
     
     def get_credit( self ):
@@ -131,11 +177,14 @@ class InstagramSource:
             credit = """After an <a href="%s">Instagram</a> by <a href="%s">%s</a> (via <a href="http://web.stagram.com/">Webstagram</a>).""" % ( photo_link, author_link, author_name )
         return credit
 
+    def get_tag( self ):
+        return self.tag
+
+
 def dump_file( pth, contents ):
     fh = open( pth, 'w')
     fh.write( contents )
     fh.close()
-
 
 ###
 # START THE FANS, PLEASE!
@@ -180,7 +229,8 @@ if la > 1:
         pth_offline_face = sys.argv[3]
 else:
     
-    sources = [ FlickrSource(flickr), ffffoundSource(), InstagramSource() ]
+    # set up list of sources. ffffound is repeated twice to increase the chances of picking it.
+    sources = [ FlickrSource(flickr), ffffoundSource(), ffffoundSource(), InstagramSource() ]
     image_source = random.choice( sources )
     image_url = image_source.get_image_url()
 
@@ -254,8 +304,15 @@ if retcode > 0:
 
 # upload to flickr
 logger.info( "Uploading to Flickr..." )
-machine_tag = "fitc:neighborcount=%d" % highest_score 
-tags = [ "notaphoto", "facesinthecloud", machine_tag ]
+
+## construct tags
+score_tag = "fitc:neighborcount=%d" % highest_score 
+tags = [ "notaphoto", "facesinthecloud", score_tag ]
+image_tag = image_source.get_tag()
+if image_tag is not None:
+    image_tag = "fitc:originaltag=%s" % image_tag
+    tags.append( image_tag )
+
 title = datetime.datetime.now().strftime('%A, %d %B %Y at %H:%M:%S')
 response = flickr.upload( filename=pth_outfile, title=title, description=image_source.get_credit(), tags=" ".join(tags) )
 
