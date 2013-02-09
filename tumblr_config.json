@@ -1,0 +1,6 @@
+{
+    "consumer_secret": "app key",
+    "consumer_key": "app secret", 
+    "oauth_token": "gained through oauth",
+    "oauth_secret": "gained through oauth too"
+ }

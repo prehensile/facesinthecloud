@@ -12,7 +12,7 @@ import json
 import datetime
 import xml.etree.ElementTree as ElementTree
 import re
-
+import tumblpy
 
 class FlickrSource:
 
@@ -21,6 +21,7 @@ class FlickrSource:
         self.api = api
         self.photo_id = None
         self.tag = None
+        self.photo_info = None
 
     def get_image_url( self ):
         logger.info( "Fetching from Flickr..." )
@@ -64,6 +65,7 @@ class FlickrSource:
                     
                     self.photo_id = photo_id
                     self.tag = tag
+                    self.photo_info = self.api.photos_getInfo( photo_id=photo_id )
 
             except UnicodeDecodeError, e:
                 # do nothing if tag encode failed
@@ -75,13 +77,18 @@ class FlickrSource:
     
     def get_credit( self ):
         credit = None
-        photo_info = self.api.photos_getInfo( photo_id=self.photo_id )
-        if photo_info is not None:
-            author_name = photo_info.find( "photo/owner" ).attrib['username']
-            author_link = "http://www.flickr.com/people/%s/" % photo_info.find( "photo/owner" ).attrib['nsid']
-            item_link = photo_info.find( "photo/urls/url[@type='photopage']" ).text
+        if self.photo_info is not None:
+            author_name = self.photo_info.find( "photo/owner" ).attrib['username']
+            author_link = "http://www.flickr.com/people/%s/" % self.photo_info.find( "photo/owner" ).attrib['nsid']
+            item_link = self.get_original_link()
             credit = """After an <a href="%s">original</a> by <a href="%s">%s</a>.""" % ( item_link, author_link, author_name )
         return credit
+
+    def get_original_link( self ):
+        link = None
+        if self.photo_info is not None:
+            link = self.photo_info.find( "photo/urls/url[@type='photopage']" ).text
+        return link
 
     def get_tag( self ):
         return self.tag
@@ -113,7 +120,7 @@ class ffffoundSource:
     def get_credit( self ):
         credit = None
         if self.item is not None:
-            link = self.item.find("link").string
+            link = self.get_original_link()
             author = self.item.find("author").string
             author_link = "http://ffffound.com/home/%s/found/" % author
             credit = """After a <a href="%s">ffffinding</a> by <a href="%s">%s</a>.""" % ( link, author_link, author )
@@ -121,6 +128,12 @@ class ffffoundSource:
 
     def get_tag( self ):
         return None
+
+    def get_original_link( self ):
+        link = None
+        if self.item is not None:
+            link = self.item.find("link").string
+        return link
 
 
 class InstagramSource:
@@ -145,7 +158,12 @@ class InstagramSource:
         h = urllib2.urlopen( "http://web.stagram.com/hot/" )
         soup = Soup.BeautifulStoneSoup( h.read() )
         tags = soup.findAll( "a", href=re.compile("^/tag/") )
-        tag = random.choice( tags )
+        banned_tags = [ "fashion" ]  # spammy
+        tag = None
+        while tag is None:
+            tag = random.choice( tags )
+            if tag.text in banned_tags:
+                tag = None
         self.tag = tag.text[1:]  # chop off the # at the beginning
         logger.info( "...using tag: %s" % self.tag )
 
@@ -171,7 +189,7 @@ class InstagramSource:
     def get_credit( self ):
         credit = None
         if self.item is not None:
-            photo_link = self.photopage_soup.find( "a", href=re.compile( "^http://instagr.am" ), recursive=True )['href']
+            photo_link = self.get_original_link()
             author_name = self.photopage_soup.find( "div", "infolist" ).find( "a", recursive=True, href=re.compile( "^/n/" ) ).text
             author_link = "http://instagram.com/%s" % author_name
             credit = """After an <a href="%s">Instagram</a> by <a href="%s">%s</a> (via <a href="http://web.stagram.com/">Webstagram</a>).""" % ( photo_link, author_link, author_name )
@@ -180,6 +198,11 @@ class InstagramSource:
     def get_tag( self ):
         return self.tag
 
+    def get_original_link( self ):
+        link = None
+        if self.item is not None:
+            link = self.photopage_soup.find( "a", href=re.compile( "^http://instagr.am" ), recursive=True )['href']
+        return link
 
 def dump_file( pth, contents ):
     fh = open( pth, 'w')
@@ -261,8 +284,8 @@ if faces is None or len(faces) < 1:
     logger.error( "No matches found in image, bailing..." )
     exit(1)
 
-NEIGHBOUR_UPPER_THRESHOLD = 18  # any matches with more neighbours than this are too good
-NEIGHBOUR_LOWER_THRESHOLD = 3  # any matches with fewer neighbours than this are no good
+NEIGHBOUR_UPPER_THRESHOLD = 12  # any matches with more neighbours than this are too good
+NEIGHBOUR_LOWER_THRESHOLD = 4  # any matches with fewer neighbours than this are no good
 highest_score = 0
 for (x,y,w,h),n in faces:
     if n > highest_score:
@@ -294,28 +317,71 @@ args = [ pth_offline_face_exe,
 
 retcode = subprocess.call( args )
 
+if retcode > 0:
+    logger.error( "offline_face failed." )
+else:
+    
+    # construct tags, title, description
+    score_tag = "fitc:neighborcount=%d" % highest_score 
+    tags = [ "notaphoto", "facesinthecloud", score_tag ]
+    image_tag = image_source.get_tag()
+    if image_tag is not None:
+        image_tag = "fitc:originaltag=%s" % image_tag
+        tags.append( image_tag )
+
+    title = datetime.datetime.now().strftime('%A, %d %B %Y at %H:%M:%S')
+    description = image_source.get_credit()
+    original_link = image_source.get_original_link()
+
+    # upload to flickr
+    logger.info( "Uploading to Flickr..." )
+    response = flickr.upload( filename=pth_outfile, title=title, description=description, tags=" ".join(tags) )
+    photoid = response.find("photoid").text
+    flickr_image_url = None
+    ## get image url (for tumblpy's image source)
+    if photoid:
+        logger.info( "Upload complete. photoid is %s" % photoid )
+        sizes = flickr.photos_getSizes( photo_id=photoid ).findall("sizes/size")
+        max_size = 0
+        for size in sizes:
+            w = int(size.attrib['width'])
+            if w > max_size:
+                flickr_image_url = size.attrib['source']
+                max_size_found = w
+
+    # post to tumblr
+    logger.info( "Posting to Tumblr..." )
+
+    ## load keys
+    fh = open( "tumblr_config.json")
+    tumblr_config = json.load( fh )
+    fh.close()
+
+    t = tumblpy.Tumblpy( app_key = tumblr_config["consumer_key"],
+                    app_secret = tumblr_config["consumer_secret"],
+                    oauth_token = tumblr_config["oauth_token"],
+                    oauth_token_secret = tumblr_config['oauth_secret'] )
+
+    blog_url = t.post('user/info')
+    blog_url = blog_url['user']['blogs'][0]['url']
+
+    #fh_original = open( image_path, 'rb' )
+    #fh_processed = open( pth_outfile, 'rb' )
+    post_params = { 'type' : 'photo',
+                    'tags' : ",".join(tags),
+                    'caption': description,
+                    # using the flickr URL here since binary uploads seem to be broken in tumblpy
+                    'source' : flickr_image_url }
+    if original_link is not None:
+        post_params[ 'link' ] = original_link
+    
+    post_id = t.post( 'post', blog_url=blog_url, params=post_params )
+    logger.info( "Post complete. post_id is %s" % post_id )
+
 # remove source image if we downloaded it
 if commandline_image is False: 
     os.remove( image_path ) 
 
-if retcode > 0:
-    logger.error( "offline_face failed. Bailing..." )
-    exit(1)
-
-# upload to flickr
-logger.info( "Uploading to Flickr..." )
-
-## construct tags
-score_tag = "fitc:neighborcount=%d" % highest_score 
-tags = [ "notaphoto", "facesinthecloud", score_tag ]
-image_tag = image_source.get_tag()
-if image_tag is not None:
-    image_tag = "fitc:originaltag=%s" % image_tag
-    tags.append( image_tag )
-
-title = datetime.datetime.now().strftime('%A, %d %B %Y at %H:%M:%S')
-response = flickr.upload( filename=pth_outfile, title=title, description=image_source.get_credit(), tags=" ".join(tags) )
-
-logger.info( "Upload complete, photoid is %s" % response.find("photoid").text )
-
-os.remove( pth_outfile )
+# ...and remove generated image
+if os.path.exists( pth_outfile ):
+    os.remove( pth_outfile )
