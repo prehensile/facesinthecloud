@@ -11,8 +11,8 @@ def sig_for_params( params, api_secret ):
         concat += "%s%s" % (key, val)
     return hashlib.md5( concat ).hexdigest()
 
-def sign_params( params ):
-    sig = sig_for_params( params )
+def sign_params( params, api_secret ):
+    sig = sig_for_params( params, api_secret )
     params[ "api_sig" ] = sig
     return( params )
 
@@ -42,25 +42,23 @@ class FlickrAuthApp:
             config = self.read_config()
 
             resp = u"<html><body>"
-
             resp += "Recieved frob: %s<br/>" % frob
 
             params = { "method" : "flickr.auth.getToken",
                         "api_key" : config["api_key"],
                         "format" : "json",
                         "frob" : frob }
-            params = sign_params( params )
+            params = sign_params( params, config["api_secret"] )
             auth_url = "http://api.flickr.com/services/rest/"
             h = urllib.urlopen( auth_url, urllib.urlencode( params ) )
             payload = h.read()
             
             resp += auth_url
-
             resp += payload
 
             config["token"] = payload["auth"]["token"]["_content"]
             fh = open( "flickr_config.json", "w" )
-            
+            json.dump( config, fh )
             fh.close()
 
             resp += "</body></html>"
