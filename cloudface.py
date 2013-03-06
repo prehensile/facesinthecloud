@@ -10,9 +10,11 @@ import logging
 import flickrapi
 import json
 import datetime
-import xml.etree.ElementTree as ElementTree
+#import xml.etree.ElementTree as ElementTree
+import lxml.etree as ElementTree
 import re
-import tumblpy
+#import tumblpy
+import tumblr_client
 
 class FlickrSource:
 
@@ -59,7 +61,7 @@ class FlickrSource:
                     max_size_usable = 1024
                     for size in sizes:
                         w = int(size.attrib['width'])
-                        if w > max_size_found and w < max_size_usable:
+                        if w > max_size_found and w <= max_size_usable:
                             image_url = size.attrib['source']
                             max_size_found = w
                     
@@ -87,7 +89,10 @@ class FlickrSource:
     def get_original_link( self ):
         link = None
         if self.photo_info is not None:
-            link = self.photo_info.find( "photo/urls/url[@type='photopage']" ).text
+            links = self.photo_info.findall( "photo/urls/url" )
+            for this_link in links: 
+                if this_link.attrib.get("type") == 'photopage':
+                    link = this_link.text
         return link
 
     def get_tag( self ):
@@ -262,7 +267,26 @@ else:
         logger.error( "No image url found in chosen source. Bailing..." )
         exit(1)
 
+    # check for URL in history file
+    history_path = os.path.join( cloudface_dir, 'history.log' )
+    used_url = False
+    if os.path.exists( history_path ):
+        fh = open( history_path )
+        for line in fh:
+            if image_url in line:
+                used_url = True
+                break
+        fh.close()
+    if used_url:
+        logger.error( "Image URL %s has already been used. Bailing..." % image_url )
+        exit(1)
+
     logger.info( "Using image at %s" % image_url )
+
+    # write URL to history file
+    fh = open( history_path, 'a' )
+    fh.write( "%s\n" % image_url )
+    fh.close()
 
     # construct local path for downloaded file
     image_filename = os.path.basename( urlparse.urlsplit( image_url ).path )
@@ -277,19 +301,29 @@ if image_path is None:
     exit(1) 
 
 # check image for an almost-face
-hc = cv.Load("haarcascade_frontalface_default.xml")
-img = cv.LoadImage( image_path, cv.CV_LOAD_IMAGE_GRAYSCALE)
-faces = cv.HaarDetectObjects(img, hc, cv.CreateMemStorage(), 1.1, 1 )
-if faces is None or len(faces) < 1:
-    logger.error( "No matches found in image, bailing..." )
-    exit(1)
-
+img = cv.LoadImage( image_path, cv.CV_LOAD_IMAGE_GRAYSCALE )
+cascades = [ "haarcascade_frontalface_default.xml", "haarcascade_frontalface_alt.xml", "haarcascade_frontalface_alt2.xml", "haarcascade_frontalface_alt_tree.xml" ]
 NEIGHBOUR_UPPER_THRESHOLD = 12  # any matches with more neighbours than this are too good
 NEIGHBOUR_LOWER_THRESHOLD = 4  # any matches with fewer neighbours than this are no good
 highest_score = 0
-for (x,y,w,h),n in faces:
-    if n > highest_score:
-        highest_score = n
+faces_detected = False
+
+for cascade in cascades:
+    
+    hc = cv.Load( cascade )
+    faces = cv.HaarDetectObjects(img, hc, cv.CreateMemStorage(), 1.1, 1 )
+
+    if faces is not None and len(faces) > 0:
+        faces_detected = True
+        for (x,y,w,h),n in faces:
+            if n > highest_score:
+                highest_score = n
+    del faces
+    del hc
+
+if not faces_detected:
+    logger.error( "No matches found in image, bailing..." )
+    exit(1)
 
 logger.info( "Highest face score is %d" % highest_score )
 if highest_score > NEIGHBOUR_UPPER_THRESHOLD:   
@@ -323,7 +357,7 @@ else:
     
     # construct tags, title, description
     score_tag = "fitc:neighborcount=%d" % highest_score 
-    tags = [ "notaphoto", "facesinthecloud", score_tag ]
+    tags = [ "facesinthecloud", score_tag ]
     image_tag = image_source.get_tag()
     if image_tag is not None:
         image_tag = "fitc:originaltag=%s" % image_tag
@@ -335,7 +369,9 @@ else:
 
     # upload to flickr
     logger.info( "Uploading to Flickr..." )
-    response = flickr.upload( filename=pth_outfile, title=title, description=description, tags=" ".join(tags) )
+    flickr_tags = [ "notaphoto" ]
+    flickr_tags.extend( tags )
+    response = flickr.upload( filename=pth_outfile, title=title, description=description, tags=" ".join(flickr_tags) )
     photoid = response.find("photoid").text
     flickr_image_url = None
     ## get image url (for tumblpy's image source)
@@ -357,25 +393,38 @@ else:
     tumblr_config = json.load( fh )
     fh.close()
 
-    t = tumblpy.Tumblpy( app_key = tumblr_config["consumer_key"],
-                    app_secret = tumblr_config["consumer_secret"],
-                    oauth_token = tumblr_config["oauth_token"],
-                    oauth_token_secret = tumblr_config['oauth_secret'] )
+    # t = tumblpy.Tumblpy( app_key = tumblr_config["consumer_key"],
+    #                 app_secret = tumblr_config["consumer_secret"],
+    #                 oauth_token = tumblr_config["oauth_token"],
+    #                 oauth_token_secret = tumblr_config['oauth_secret'] )
 
-    blog_url = t.post('user/info')
-    blog_url = blog_url['user']['blogs'][0]['url']
+    # blog_url = t.post('user/info')
+    # blog_url = blog_url['user']['blogs'][0]['url']
 
-    #fh_original = open( image_path, 'rb' )
-    #fh_processed = open( pth_outfile, 'rb' )
+    # #fh_original = open( image_path, 'rb' )
+    # #fh_processed = open( pth_outfile, 'rb' )
+    # post_params = { 'type' : 'photo',
+    #                 'tags' : ",".join(tags),
+    #                 'caption': description,
+    #                 # using the flickr URL here since binary uploads seem to be broken in tumblpy
+    #                 'source' : flickr_image_url }
+    # if original_link is not None:
+    #     post_params[ 'link' ] = original_link
+    
+    # post_id = t.post( 'post', blog_url=blog_url, params=post_params )
+
+    t = tumblr_client.TumblrClient( consumer_key = tumblr_config[ "consumer_key" ],
+                                secret_key = tumblr_config[ "consumer_secret" ],
+                                oauth_token = tumblr_config[ "oauth_token" ],
+                                oauth_token_secret = tumblr_config[ 'oauth_secret' ] )
+    
+    blog_url = tumblr_config[ "blog_url" ]
     post_params = { 'type' : 'photo',
                     'tags' : ",".join(tags),
-                    'caption': description,
-                    # using the flickr URL here since binary uploads seem to be broken in tumblpy
-                    'source' : flickr_image_url }
-    if original_link is not None:
-        post_params[ 'link' ] = original_link
-    
-    post_id = t.post( 'post', blog_url=blog_url, params=post_params )
+                    'caption': description }
+    files = [ open( pth_outfile, 'rb' ), open( image_path, 'rb' ) ]
+
+    post_id = t.post( blog_url=blog_url, params=post_params, files=files )
     logger.info( "Post complete. post_id is %s" % post_id )
 
 # remove source image if we downloaded it
@@ -385,3 +434,7 @@ if commandline_image is False:
 # ...and remove generated image
 if os.path.exists( pth_outfile ):
     os.remove( pth_outfile )
+
+if retcode > 0:
+    # make sure offline_face errors are reflected in our return code
+    exit(1)
